@@ -42,7 +42,7 @@ function showCamera(app: App): void {
       <p class="eyebrow">Squawk PLZ</p>
       <h1>Read the squawk</h1>
     </header>
-    <p class="lead">Fill the frame with the four digits on the segmented display.</p>
+    <p class="lead">Fill the view with the radio. The frame is the shape of the green squawk on the XPDR line.</p>
     <p class="status" data-status></p>
     <div class="stage" data-stage hidden>
       <video data-video playsinline muted></video>

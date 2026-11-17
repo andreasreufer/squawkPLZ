@@ -1,4 +1,4 @@
-import { readGuide, type GuideReading, type Raster } from "./segmentReader";
+import { findSquawk, type GuideReading, type Raster } from "./segmentReader";
 
 export type Rect = { left: number; top: number; width: number; height: number };
 
@@ -44,8 +44,7 @@ export function mapGuideToVideo(video: VideoFrame, guide: Rect): Rect | null {
   return { left: clampedLeft, top: clampedTop, width: clampedWidth, height: clampedHeight };
 }
 
-const SAMPLE_WIDTH = 240;
-const SAMPLE_HEIGHT = 80;
+const SAMPLE_EDGE = 960;
 
 export function sampleGuide(
   video: HTMLVideoElement,
@@ -64,21 +63,18 @@ export function sampleGuide(
 
   const context = canvas.getContext("2d", { willReadFrequently: true });
   if (!context) return null;
-  canvas.width = SAMPLE_WIDTH;
-  canvas.height = SAMPLE_HEIGHT;
-  context.drawImage(
-    video,
-    source.left,
-    source.top,
-    source.width,
-    source.height,
-    0,
-    0,
-    SAMPLE_WIDTH,
-    SAMPLE_HEIGHT,
-  );
-  const image = context.getImageData(0, 0, SAMPLE_WIDTH, SAMPLE_HEIGHT);
-  return readGuide(image as Raster);
+  const aspect = source.width / source.height;
+  let sampleWidth = SAMPLE_EDGE;
+  let sampleHeight = Math.max(1, Math.round(SAMPLE_EDGE / aspect));
+  if (sampleHeight > SAMPLE_EDGE) {
+    sampleHeight = SAMPLE_EDGE;
+    sampleWidth = Math.max(1, Math.round(SAMPLE_EDGE * aspect));
+  }
+  canvas.width = sampleWidth;
+  canvas.height = sampleHeight;
+  context.drawImage(video, source.left, source.top, source.width, source.height, 0, 0, sampleWidth, sampleHeight);
+  const image = context.getImageData(0, 0, sampleWidth, sampleHeight);
+  return findSquawk(image as Raster);
 }
 
 export async function openCamera(video: HTMLVideoElement): Promise<MediaStream> {
