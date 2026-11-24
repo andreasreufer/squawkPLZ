@@ -240,7 +240,7 @@ function showConfirm(app: App, initial: Digit[]): void {
       drawPlaceMap(map, app.atlas, position);
     }
     miss.hidden = hit !== null;
-    miss.textContent = shown ? `No match. Closest PLZ is ${shown.plz}` : "No match";
+    miss.textContent = shown ? `Closest match is ${shown.plz}` : "No match";
   };
 
   refresh();
