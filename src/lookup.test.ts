@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
   assertCsvContract,
+  closestPlz,
   isReservedEmergency,
   lookupPlz,
   lookupSquawk,
@@ -75,6 +76,10 @@ describe("parseLocalityCsv", () => {
     expect(lookupPlz(result.places, "4001")).toEqual({ plz: "4001", place: "Basel" });
     expect(lookupPlz(result.places, "1008")).toBeNull();
     expect(lookupPlz(result.places, "1200")).toBeNull();
+    expect(closestPlz(result.places, "7000")).toEqual({ plz: "7000", place: "Chur" });
+    expect(closestPlz(result.places, "1200")?.plz).toBe(nearestKnown(result.places, 1200));
+    expect(closestPlz(result.places, "0100")).toEqual({ plz: "1000", place: "Lausanne 25" });
+    expect(closestPlz(result.places, "1238")).toBeNull();
     expect(placeForPlz(result.places, "8001", "EXAMPLE Zurich")).toBe("Zürich");
     expect(placeForPlz(result.places, "3000", "EXAMPLE Bern")).toBe("EXAMPLE Bern");
   });
@@ -97,3 +102,12 @@ describe("isReservedEmergency", () => {
     expect(isReservedEmergency("7000")).toBe(false);
   });
 });
+
+function nearestKnown(places: ReadonlyMap<string, string>, target: number): string {
+  for (let distance = 0; ; distance += 1) {
+    for (const candidate of [target - distance, target + distance]) {
+      const plz = String(candidate).padStart(4, "0");
+      if (places.has(plz)) return plz;
+    }
+  }
+}

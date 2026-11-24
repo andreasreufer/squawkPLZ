@@ -5,7 +5,7 @@ import {
   setTorch,
   trackHasTorch,
 } from "./camera";
-import { isReservedEmergency, lookupPlz, type LocalityMap } from "./lookup";
+import { closestPlz, isReservedEmergency, lookupPlz, type LocalityMap } from "./lookup";
 import type { GuideReading } from "./segmentReader";
 import { updateStability, type StabilityState } from "./stability";
 
@@ -155,13 +155,13 @@ function showConfirm(app: App, initial: Digit[]): void {
     <div class="digits" data-digits></div>
     <p class="emergency" data-emergency hidden>Reserved emergency code.</p>
     <div data-result hidden aria-live="polite">
+      <p class="miss" data-miss hidden>No match</p>
       <dl class="result">
         <div data-place-row>
           <dt>Place</dt>
           <dd data-place></dd>
         </div>
       </dl>
-      <p class="miss" data-miss hidden>No match</p>
     </div>
     <div class="actions">
       <button type="button" class="secondary" data-back>Back</button>
@@ -212,14 +212,15 @@ function showConfirm(app: App, initial: Digit[]): void {
     }
     const hit = lookupPlz(app.localities, code);
     result.hidden = false;
-    if (hit) {
-      place.textContent = hit.place;
+    const shown = hit ?? closestPlz(app.localities, code);
+    if (shown) {
+      place.textContent = hit ? shown.place : `${shown.plz} ${shown.place}`;
       placeRow?.removeAttribute("hidden");
-      miss.hidden = true;
     } else {
       placeRow?.setAttribute("hidden", "");
-      miss.hidden = false;
     }
+    miss.hidden = hit !== null;
+    miss.textContent = shown ? `No match. Closest PLZ is ${shown.plz}` : "No match";
   };
 
   refresh();

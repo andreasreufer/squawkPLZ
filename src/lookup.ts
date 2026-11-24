@@ -172,6 +172,23 @@ export function lookupPlz(places: LocalityMap, code: string): PlaceHit | null {
   return { plz, place };
 }
 
+/** The known postal code numerically nearest to the code; on a tie the lower one wins. */
+export function closestPlz(places: LocalityMap, code: string): PlaceHit | null {
+  const plz = squawkAsDecimalPlz(code);
+  if (!plz) return null;
+  const target = Number(plz);
+  let best: PlaceHit | null = null;
+  let bestDistance = Number.POSITIVE_INFINITY;
+  for (const [candidate, place] of places) {
+    const distance = Math.abs(Number(candidate) - target);
+    if (distance < bestDistance || (distance === bestDistance && best && candidate < best.plz)) {
+      best = { plz: candidate, place };
+      bestDistance = distance;
+    }
+  }
+  return best;
+}
+
 export function formatCsvErrors(errors: readonly CsvIssue[]): string {
   return errors.map((error) => `line ${error.line}: ${error.message}`).join("\n");
 }
