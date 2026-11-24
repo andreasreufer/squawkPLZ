@@ -1,3 +1,5 @@
+import { GLYPH_MODEL } from "./glyphModel";
+
 export const SEGMENT_TEMPLATES: readonly (readonly number[])[] = [
   [1, 1, 1, 0, 1, 1, 1],
   [0, 0, 1, 0, 0, 1, 0],
@@ -100,8 +102,12 @@ export function findSquawk(image: Raster): GuideReading {
     return EMPTY_READING;
   }
 
-  const green = lowestCode(readGreen(image).codes);
-  const chosen = green ?? lowestCode(codesInMask(inkMask(image), image.width, image.height));
+  const green = readGreen(image);
+  // Plain ink is only a fallback for displays without green text; on a radio page it finds labels and frames.
+  const chosen =
+    green.lines.length > 0
+      ? lowestCode(green.codes)
+      : lowestCode(codesInMask(inkMask(image), image.width, image.height));
   if (!chosen) return EMPTY_READING;
   return { digits: chosen.digits, code: chosen.digits.join("") };
 }
@@ -199,21 +205,30 @@ function lowestCode(codes: FoundCode[]): FoundCode | null {
 }
 
 function readGreen(image: Raster): { codes: FoundCode[]; lines: string[] } {
-  const loose = greenMask(image);
-  const bands = bandSpans(loose, image.width, image.height);
-  let tallest = 0;
-  for (const band of bands) tallest = Math.max(tallest, band.bottom - band.top + 1);
   const codes: FoundCode[] = [];
   const lines: string[] = [];
-  for (const band of bands) {
-    const bandHeight = band.bottom - band.top + 1;
-    if (tallest > 0 && bandHeight < tallest * 0.72) continue;
+  for (const band of greenBands(image)) {
     const mask = strictBandMask(image, band.top, band.bottom);
     const read = codesInBand(mask, image.width, band.top, band.bottom);
     lines.push(`${band.top}: ${read.text}`);
     codes.push(...read.codes);
   }
   return { codes, lines };
+}
+
+/** Rows of green text that are tall enough to hold the squawk. */
+function greenBands(image: Raster): { top: number; bottom: number }[] {
+  const bands = bandSpans(greenMask(image), image.width, image.height);
+  let tallest = 0;
+  for (const band of bands) tallest = Math.max(tallest, band.bottom - band.top + 1);
+  return bands.filter((band) => band.bottom - band.top + 1 >= tallest * 0.72);
+}
+
+/** The glyph boxes of every green text line, for training and diagnostics. */
+export function greenLines(image: Raster): GlyphLine[] {
+  return greenBands(image).map((band) =>
+    lineBoxes(strictBandMask(image, band.top, band.bottom), image.width, band.top, band.bottom),
+  );
 }
 
 function bandSpans(mask: Uint8Array, width: number, height: number): { top: number; bottom: number }[] {
@@ -236,9 +251,14 @@ function bandSpans(mask: Uint8Array, width: number, height: number): { top: numb
   return bands;
 }
 
-/** Keeps the bright core of each stroke so camera bloom does not fuse neighboring digits. */
+/**
+ * Keeps the bright core of each stroke so camera bloom does not fuse neighboring digits.
+ * The band is softened first, because a photo of an LCD shows its pixel grid as gaps through every stroke.
+ */
 function strictBandMask(image: Raster, top: number, bottom: number): Uint8Array {
-  const { width, height, data } = image;
+  const { width, height } = image;
+  const radius = Math.max(1, Math.round((bottom - top + 1) / 30));
+  const data = blurRows(image, top, bottom, radius);
   let peak = 0;
   for (let y = top; y <= bottom; y += 1) {
     for (let x = 0; x < width; x += 1) {
@@ -262,6 +282,56 @@ function strictBandMask(image: Raster, top: number, bottom: number): Uint8Array 
     }
   }
   return mask;
+}
+
+/** Box blur of the rows top..bottom; other rows are left empty. */
+function blurRows(image: Raster, top: number, bottom: number, radius: number): Uint8ClampedArray {
+  const { width, height, data } = image;
+  const first = Math.max(0, top - radius);
+  const last = Math.min(height - 1, bottom + radius);
+  const across = new Float32Array(width * height * 3);
+  for (let y = first; y <= last; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const x0 = Math.max(0, x - radius);
+      const x1 = Math.min(width - 1, x + radius);
+      let red = 0;
+      let green = 0;
+      let blue = 0;
+      for (let sx = x0; sx <= x1; sx += 1) {
+        const index = (y * width + sx) * 4;
+        red += data[index] ?? 0;
+        green += data[index + 1] ?? 0;
+        blue += data[index + 2] ?? 0;
+      }
+      const count = x1 - x0 + 1;
+      const out = (y * width + x) * 3;
+      across[out] = red / count;
+      across[out + 1] = green / count;
+      across[out + 2] = blue / count;
+    }
+  }
+  const blurred = new Uint8ClampedArray(width * height * 4);
+  for (let y = top; y <= bottom; y += 1) {
+    const y0 = Math.max(first, y - radius);
+    const y1 = Math.min(last, y + radius);
+    for (let x = 0; x < width; x += 1) {
+      let red = 0;
+      let green = 0;
+      let blue = 0;
+      for (let sy = y0; sy <= y1; sy += 1) {
+        const index = (sy * width + x) * 3;
+        red += across[index] ?? 0;
+        green += across[index + 1] ?? 0;
+        blue += across[index + 2] ?? 0;
+      }
+      const count = y1 - y0 + 1;
+      const out = (y * width + x) * 4;
+      blurred[out] = red / count;
+      blurred[out + 1] = green / count;
+      blurred[out + 2] = blue / count;
+    }
+  }
+  return blurred;
 }
 
 function greenMask(image: Raster): Uint8Array {
@@ -300,12 +370,22 @@ function codesInMask(mask: Uint8Array, width: number, height: number): FoundCode
   return found;
 }
 
-function codesInBand(
-  mask: Uint8Array,
-  width: number,
-  top: number,
-  bottom: number,
-): { codes: FoundCode[]; text: string } {
+export type GlyphBox = {
+  left: number;
+  right: number;
+  top: number;
+  bottom: number;
+  /** A decimal point. */
+  dot: boolean;
+  /** Too short or too wide to be a digit, so it closes any run of digits. */
+  breaksRun: boolean;
+  glyph: Binary;
+};
+
+export type GlyphLine = { top: number; bottom: number; boxes: GlyphBox[]; typicalWidth: number; glyphHeight: number };
+
+/** Splits one text line into glyph boxes from left to right. */
+export function lineBoxes(mask: Uint8Array, width: number, top: number, bottom: number): GlyphLine {
   const bandHeight = bottom - top + 1;
   const columns = new Uint16Array(width);
   for (let y = top; y <= bottom; y += 1) {
@@ -325,8 +405,8 @@ function codesInBand(
     }
   }
 
-  type Box = { left: number; right: number; top: number; bottom: number; dot: boolean };
-  const boxes: Box[] = [];
+  type Bounds = { left: number; right: number; top: number; bottom: number; dot: boolean };
+  const bounds: Bounds[] = [];
   for (const span of spans) {
     let left = span.right;
     let right = span.left;
@@ -351,30 +431,78 @@ function codesInBand(
     const dot = boxHeight < bandHeight * 0.55 && center > top + bandHeight * 0.55;
     const speck = !dot && boxHeight < bandHeight * 0.4 && boxWidth < bandHeight * 0.35;
     if (speck) continue;
-    boxes.push({ left, right, top: boxTop, bottom: boxBottom, dot });
+    bounds.push({ left, right, top: boxTop, bottom: boxBottom, dot });
   }
 
-  const fullWidths = boxes.filter((box) => !box.dot).map((box) => box.right - box.left + 1);
-  const typical = median(fullWidths);
+  mergeSerifs(bounds, bandHeight);
+  const typicalWidth = median(bounds.filter((box) => !box.dot).map((box) => box.right - box.left + 1));
+  // Glare can make the band taller than its text, so digits are judged against their neighbors.
+  const glyphHeight =
+    median(bounds.map((box) => box.bottom - box.top + 1).filter((boxHeight) => boxHeight >= bandHeight * 0.5)) ||
+    bandHeight;
+  const boxes = bounds.map((box): GlyphBox => {
+    const boxWidth = box.right - box.left + 1;
+    const boxHeight = box.bottom - box.top + 1;
+    const breaksRun = box.dot || boxHeight < glyphHeight * 0.75 || boxWidth > glyphHeight * 1.7;
+    const glyph = crop(mask, width, box);
+    return { ...box, breaksRun, glyph };
+  });
+  return { top, bottom, boxes, typicalWidth, glyphHeight };
+}
+
+/** Joins a stray foot or flag back onto the tall glyph it almost touches; a real decimal point sits farther off. */
+function mergeSerifs(
+  bounds: { left: number; right: number; top: number; bottom: number; dot: boolean }[],
+  bandHeight: number,
+): void {
+  const reach = Math.max(1, Math.round(bandHeight * 0.08));
+  const tall = (box: { top: number; bottom: number }) => box.bottom - box.top + 1 >= bandHeight * 0.62;
+  for (let index = 0; index < bounds.length; index += 1) {
+    const box = bounds[index];
+    if (!box || tall(box)) continue;
+    const before = bounds[index - 1];
+    const after = bounds[index + 1];
+    const host =
+      before && tall(before) && box.left - before.right - 1 <= reach
+        ? before
+        : after && tall(after) && after.left - box.right - 1 <= reach
+          ? after
+          : null;
+    if (!host) continue;
+    host.left = Math.min(host.left, box.left);
+    host.right = Math.max(host.right, box.right);
+    host.top = Math.min(host.top, box.top);
+    host.bottom = Math.max(host.bottom, box.bottom);
+    bounds.splice(index, 1);
+    index -= 1;
+  }
+}
+
+function codesInBand(
+  mask: Uint8Array,
+  width: number,
+  top: number,
+  bottom: number,
+): { codes: FoundCode[]; text: string } {
+  const { boxes, typicalWidth, glyphHeight } = lineBoxes(mask, width, top, bottom);
   const found: FoundCode[] = [];
   const symbols: string[] = [];
   let run: number[] = [];
   let poisoned = false;
   let previousRight = -1;
 
+  let runBoxes: GlyphBox[] = [];
   const flush = () => {
-    if (!poisoned && run.length === 4) found.push({ digits: run.slice(), top });
+    if (!poisoned && run.length === 4 && evenlySpaced(runBoxes, run, glyphHeight)) found.push({ digits: run.slice(), top });
     run = [];
+    runBoxes = [];
     poisoned = false;
   };
 
   for (const box of boxes) {
     const gap = previousRight < 0 ? 0 : box.left - previousRight - 1;
     previousRight = box.right;
-    const boxWidth = box.right - box.left + 1;
-    const boxHeight = box.bottom - box.top + 1;
-    const endsTheCode = box.dot || boxHeight < bandHeight * 0.62 || boxWidth > bandHeight * 1.7;
-    if (endsTheCode) {
+    if (box.breaksRun) {
       symbols.push(box.dot ? "." : "-");
       if (run.length === 4 && !poisoned) {
         flush();
@@ -383,17 +511,10 @@ function codesInBand(
       flush();
       continue;
     }
-    const glyph = crop(mask, width, box);
-    const aspect = boxWidth / boxHeight;
-    const narrowerThanNeighbors = typical > 0 && boxWidth < typical * 0.8;
-    const looksLikeOne =
-      boxHeight > bandHeight * 0.65 &&
-      (aspect < 0.5 || (aspect < 0.6 && narrowerThanNeighbors)) &&
-      countHoles(glyph) === 0;
-    const digit = looksLikeOne ? 1 : classifyGlyph(glyph);
+    const digit = classifyGlyph(box.glyph);
     symbols.push(digit === null ? "?" : digit > 7 ? "X" : String(digit));
     if (run.length === 4 && !poisoned) {
-      const closeDigit = digit !== null && digit <= 7 && gap <= Math.max(2, typical * 0.7);
+      const closeDigit = digit !== null && gap <= Math.max(2, typicalWidth * 0.7);
       if (!closeDigit) {
         flush();
         break;
@@ -408,9 +529,35 @@ function codesInBand(
     }
     if (poisoned) continue;
     run.push(digit);
+    runBoxes.push(box);
   }
   flush();
   return { codes: found, text: symbols.join("") };
+}
+
+/**
+ * The digits of one code sit on a monospace grid; frame lines and stray marks do not.
+ * A one may sit anywhere in its cell, so the grid is measured on the other digits when there are two.
+ */
+function evenlySpaced(boxes: GlyphBox[], digits: number[], glyphHeight: number): boolean {
+  const centers = boxes.map((box) => (box.left + box.right) / 2);
+  let anchors = digits.flatMap((digit, index) => (digit === 1 ? [] : [index]));
+  if (anchors.length < 2) anchors = digits.map((_, index) => index);
+  const pitches = anchors
+    .slice(1)
+    .map((index, step) => {
+      const previous = anchors[step] ?? 0;
+      return ((centers[index] ?? 0) - (centers[previous] ?? 0)) / (index - previous);
+    });
+  if (pitches.length === 0) return false;
+  const widest = Math.max(...pitches);
+  const narrowest = Math.min(...pitches);
+  if (widest > glyphHeight * 1.2 || widest > narrowest * 1.5) return false;
+  const pitch = pitches.reduce((sum, value) => sum + value, 0) / pitches.length;
+  const origin = anchors[0] ?? 0;
+  return centers.every(
+    (center, index) => Math.abs(center - (centers[origin] ?? 0) - (index - origin) * pitch) <= pitch * 0.45,
+  );
 }
 
 function crop(
@@ -428,64 +575,58 @@ function crop(
   return { width: boxWidth, height: boxHeight, data };
 }
 
-type Binary = { width: number; height: number; data: Uint8Array };
+export type Binary = { width: number; height: number; data: Uint8Array };
 
-function classifyGlyph(glyph: Binary): number | null {
-  const { width, height } = glyph;
-  if (width < 2 || height < 6) return null;
-  const aspect = width / height;
-  const holes = countHoles(glyph);
-  const top = density(glyph, 0.22, 0, 0.78, 0.22);
-  const bottom = density(glyph, 0.22, 0.78, 0.78, 1);
-  const middle = density(glyph, 0.3, 0.4, 0.7, 0.6);
-  const upperLeft = density(glyph, 0, 0.15, 0.42, 0.48);
-  const upperRight = density(glyph, 0.58, 0.15, 1, 0.48);
-  const lowerLeft = density(glyph, 0, 0.52, 0.42, 0.85);
-  const lowerRight = density(glyph, 0.58, 0.52, 1, 0.85);
-
-  if (aspect < 0.5 && holes === 0) return 1;
-  const balanced = Math.min(upperLeft, upperRight, lowerLeft, lowerRight);
-  const openLowerRight =
-    lowerRight + 0.18 < lowerLeft &&
-    lowerRight < 0.42 &&
-    upperRight > 0.4 &&
-    top > 0.45 &&
-    bottom > 0.45 &&
-    middle < 0.8;
-  if (openLowerRight && holes <= 1) return 2;
-  if (holes >= 2) {
-    if (middle < 0.4 && balanced > 0.28 && top > 0.35 && bottom > 0.35) return 0;
-    return 8;
+/**
+ * Reads one digit glyph by its nearest neighbour in the trained glyph model.
+ * Returns null when the glyph is far from every example or two digits are about as close.
+ */
+export function classifyGlyph(glyph: Binary): number | null {
+  if (glyph.width < 2 || glyph.height < 6) return null;
+  const features = glyphFeatures(glyph);
+  let best = Number.POSITIVE_INFINITY;
+  let bestDigit = -1;
+  let rival = Number.POSITIVE_INFINITY;
+  for (const sample of MODEL_SAMPLES) {
+    const distance = featureDistance(features, sample.features);
+    if (distance < best) {
+      if (sample.digit !== bestDigit) rival = best;
+      best = distance;
+      bestDigit = sample.digit;
+    } else if (sample.digit !== bestDigit && distance < rival) {
+      rival = distance;
+    }
   }
-  if (holes === 1 && middle < 0.55 && balanced > 0.28) return 0;
-  if (holes === 1 && upperRight < 0.45 && lowerLeft > 0.35 && lowerRight > 0.3) return 6;
-  if (holes === 1 && lowerLeft < 0.35 && upperRight > 0.4 && upperLeft < 0.4 && middle > 0.45) return 3;
-  if (holes === 1 && lowerLeft < 0.45 && upperRight > 0.35 && upperLeft > 0.3) return 9;
-  if (middle < 0.4 && top > 0.4 && bottom > 0.4 && balanced > 0.25) return 0;
-  if (top > 0.5 && bottom < 0.42 && upperLeft < 0.35 && upperRight > 0.3 && lowerLeft < 0.5) return 7;
-  if (middle > 0.4 && bottom < 0.4 && top < 0.4 && upperLeft > 0.25 && lowerRight > 0.25 && lowerLeft < 0.4) {
-    return 4;
-  }
-  if (top > 0.4 && bottom > 0.4 && middle > 0.35 && lowerRight + 0.12 < lowerLeft && lowerRight < 0.65 && upperRight > 0.35) {
-    return 2;
-  }
-  if (top > 0.4 && bottom > 0.4 && middle > 0.35 && upperRight + 0.12 < upperLeft && lowerLeft < 0.45 && lowerRight > 0.3) {
-    return 5;
-  }
-  if (
-    top > 0.4 &&
-    bottom > 0.4 &&
-    middle > 0.35 &&
-    upperLeft < 0.45 &&
-    lowerLeft < 0.45 &&
-    upperRight > 0.35 &&
-    lowerRight > 0.35 &&
-    upperLeft + lowerLeft < upperRight + lowerRight - 0.15
-  ) {
-    return 3;
-  }
-  return null;
+  if (bestDigit < 0 || best > GLYPH_MODEL.maxDistance) return null;
+  if (rival < best * GLYPH_MODEL.minRivalRatio) return null;
+  return bestDigit;
 }
+
+/** Glyph shape as ink density on a coarse grid, plus its aspect ratio. */
+export function glyphFeatures(glyph: Binary): number[] {
+  const { columns, rows } = GLYPH_MODEL;
+  const features: number[] = [];
+  for (let row = 0; row < rows; row += 1) {
+    for (let column = 0; column < columns; column += 1) {
+      features.push(density(glyph, column / columns, row / rows, (column + 1) / columns, (row + 1) / rows));
+    }
+  }
+  features.push(glyph.width / glyph.height);
+  return features;
+}
+
+export function featureDistance(left: readonly number[], right: readonly number[]): number {
+  const cells = left.length - 1;
+  let sum = 0;
+  for (let i = 0; i < cells; i += 1) sum += ((left[i] ?? 0) - (right[i] ?? 0)) ** 2;
+  const aspect = (left[cells] ?? 0) - (right[cells] ?? 0);
+  return Math.sqrt(sum / cells + GLYPH_MODEL.aspectWeight * aspect * aspect);
+}
+
+const MODEL_SAMPLES = GLYPH_MODEL.samples.map(([digit, cells, aspect]) => ({
+  digit,
+  features: [...Array.from(cells, (level) => Number(level) / 9), aspect],
+}));
 
 function density(glyph: Binary, x0: number, y0: number, x1: number, y1: number): number {
   const left = clamp(Math.floor(x0 * glyph.width), 0, glyph.width);
@@ -502,60 +643,6 @@ function density(glyph: Binary, x0: number, y0: number, x1: number, y1: number):
     }
   }
   return total > 0 ? lit / total : 0;
-}
-
-function countHoles(glyph: Binary): number {
-  const { width, height, data } = glyph;
-  const seen = new Uint8Array(data.length);
-  const queue = new Int32Array(data.length);
-  let head = 0;
-  let tail = 0;
-  const push = (x: number, y: number) => {
-    if (x < 0 || y < 0 || x >= width || y >= height) return;
-    const index = y * width + x;
-    if (seen[index] || data[index]) return;
-    seen[index] = 1;
-    queue[tail] = index;
-    tail += 1;
-  };
-  for (let x = 0; x < width; x += 1) {
-    push(x, 0);
-    push(x, height - 1);
-  }
-  for (let y = 0; y < height; y += 1) {
-    push(0, y);
-    push(width - 1, y);
-  }
-  while (head < tail) {
-    const index = queue[head] ?? 0;
-    head += 1;
-    const x = index % width;
-    const y = Math.floor(index / width);
-    push(x + 1, y);
-    push(x - 1, y);
-    push(x, y + 1);
-    push(x, y - 1);
-  }
-
-  let holes = 0;
-  for (let index = 0; index < data.length; index += 1) {
-    if (data[index] || seen[index]) continue;
-    holes += 1;
-    const x = index % width;
-    const y = Math.floor(index / width);
-    push(x, y);
-    while (head < tail) {
-      const current = queue[head] ?? 0;
-      head += 1;
-      const cx = current % width;
-      const cy = Math.floor(current / width);
-      push(cx + 1, cy);
-      push(cx - 1, cy);
-      push(cx, cy + 1);
-      push(cx, cy - 1);
-    }
-  }
-  return holes;
 }
 
 function median(values: number[]): number {

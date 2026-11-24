@@ -70,6 +70,14 @@ describe("findSquawk", () => {
     );
     expect(findSquawk(photo).code).toBe("2000");
   });
+
+  it.each([
+    ["xpdr-4567.png", "4567"],
+    ["xpdr-7654.png", "7654"],
+  ])("reads the LCD font through screen moire in %s", (fixture, code) => {
+    const photo = decodePng(readFileSync(new URL(`./fixtures/${fixture}`, import.meta.url)));
+    expect(findSquawk(photo).code).toBe(code);
+  });
 });
 
 function renderDigits(digits: number[], invert: boolean): Raster {
