@@ -20,4 +20,4 @@ if (!localities.ok) {
   throw new Error("Invalid bundled locality CSV");
 }
 
-mountApp(root, localities.places);
+mountApp(root, localities.places, localities.atlas);

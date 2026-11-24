@@ -5,7 +5,8 @@ import {
   setTorch,
   trackHasTorch,
 } from "./camera";
-import { closestPlz, isReservedEmergency, lookupPlz, type LocalityMap } from "./lookup";
+import { closestPlz, isReservedEmergency, lookupPlz, type LocalityAtlas, type LocalityMap, type LocalityPoint } from "./lookup";
+import { drawPlaceMap } from "./placeMap";
 import type { GuideReading } from "./segmentReader";
 import { updateStability, type StabilityState } from "./stability";
 
@@ -13,10 +14,11 @@ const SAMPLE_MS = 80;
 
 type Digit = number | null;
 
-export function mountApp(root: HTMLElement, localities: LocalityMap): void {
+export function mountApp(root: HTMLElement, localities: LocalityMap, atlas: LocalityAtlas): void {
   const app = {
     root,
     localities,
+    atlas,
     session: null as CameraSession | null,
   };
 
@@ -26,6 +28,7 @@ export function mountApp(root: HTMLElement, localities: LocalityMap): void {
 type App = {
   root: HTMLElement;
   localities: LocalityMap;
+  atlas: LocalityAtlas;
   session: CameraSession | null;
 };
 
@@ -162,6 +165,7 @@ function showConfirm(app: App, initial: Digit[]): void {
           <dd data-place></dd>
         </div>
       </dl>
+      <canvas class="place-map" data-map role="img" hidden></canvas>
     </div>
     <div class="actions">
       <button type="button" class="secondary" data-back>Back</button>
@@ -175,6 +179,15 @@ function showConfirm(app: App, initial: Digit[]): void {
   const place = mustQuery<HTMLElement>(view, "[data-place]");
   const placeRow = view.querySelector("[data-place-row]");
   const miss = mustQuery<HTMLElement>(view, "[data-miss]");
+  const map = mustQuery<HTMLCanvasElement>(view, "[data-map]");
+  let mapPosition: LocalityPoint | null = null;
+  let mapWidth = 0;
+  // The map is drawn at the width it has, so it is redrawn when a rotation or resize changes that width.
+  new ResizeObserver(() => {
+    if (!mapPosition || map.clientWidth === mapWidth) return;
+    mapWidth = map.clientWidth;
+    drawPlaceMap(map, app.atlas, mapPosition);
+  }).observe(map);
   const inputs: HTMLInputElement[] = [];
 
   for (let index = 0; index < 4; index += 1) {
@@ -218,6 +231,13 @@ function showConfirm(app: App, initial: Digit[]): void {
       placeRow?.removeAttribute("hidden");
     } else {
       placeRow?.setAttribute("hidden", "");
+    }
+    const position = shown ? app.atlas.positions.get(shown.plz) : undefined;
+    map.hidden = !position;
+    mapPosition = position ?? null;
+    if (shown && position) {
+      map.ariaLabel = `Map of Switzerland marking ${shown.place}`;
+      drawPlaceMap(map, app.atlas, position);
     }
     miss.hidden = hit !== null;
     miss.textContent = shown ? `No match. Closest PLZ is ${shown.plz}` : "No match";

@@ -203,3 +203,16 @@ dd {
 .miss:not([hidden]) + .result {
   margin-top: 14px;
 }
+
+.place-map {
+  display: block;
+  width: 100%;
+  margin-top: 16px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel);
+}
+
+.place-map[hidden] {
+  display: none;
+}

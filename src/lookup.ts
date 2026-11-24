@@ -6,6 +6,16 @@ export type SquawkMap = ReadonlyMap<string, PlaceHit>;
 
 export type LocalityMap = ReadonlyMap<string, string>;
 
+/** Swiss LV95 coordinates in metres: E grows to the east, N to the north. */
+export type LocalityPoint = { e: number; n: number };
+
+export type LocalityAtlas = {
+  /** Where each PLZ4 code's first row lies. */
+  positions: ReadonlyMap<string, LocalityPoint>;
+  /** Every locality row, which together draw the outline of the country. */
+  points: readonly LocalityPoint[];
+};
+
 export type ParseResult =
   | { ok: true; mapping: SquawkMap }
   | { ok: false; errors: CsvIssue[] };
@@ -97,7 +107,7 @@ export function lookupSquawk(mapping: SquawkMap, squawk: string): PlaceHit | nul
 
 export function parseLocalityCsv(
   text: string,
-): { ok: true; places: LocalityMap } | { ok: false; errors: CsvIssue[] } {
+): { ok: true; places: LocalityMap; atlas: LocalityAtlas } | { ok: false; errors: CsvIssue[] } {
   const errors: CsvIssue[] = [];
   const rows = text
     .replace(/^\uFEFF/, "")
@@ -117,6 +127,8 @@ export function parseLocalityCsv(
   const headerCells = parseCsvLine(header.raw, ";").map((cell) => cell.trim());
   const plzIndex = PLZ_COLUMN_NAMES.map((name) => headerCells.indexOf(name)).find((index) => index >= 0) ?? -1;
   const placeIndex = headerCells.indexOf("Ortschaftsname");
+  const eastIndex = headerCells.indexOf("E");
+  const northIndex = headerCells.indexOf("N");
   if (plzIndex < 0) {
     errors.push({ line: header.line, message: "Missing PLZ 4.00 column" });
   }
@@ -126,12 +138,18 @@ export function parseLocalityCsv(
   if (errors.length > 0) return { ok: false, errors };
 
   const places = new Map<string, string>();
+  const positions = new Map<string, LocalityPoint>();
+  const points: LocalityPoint[] = [];
   const settled = new Set<string>();
 
   for (const row of rows.slice(1)) {
     const cells = parseCsvLine(row.raw, ";").map((cell) => cell.trim());
     const plz = cells[plzIndex] ?? "";
     const place = cells[placeIndex] ?? "";
+    const e = Number(cells[eastIndex]);
+    const n = Number(cells[northIndex]);
+    const point = eastIndex >= 0 && northIndex >= 0 && e > 0 && n > 0 ? { e, n } : null;
+    if (point) points.push(point);
     if (settled.has(plz)) continue;
 
     if (!/^\d{4}$/.test(plz) || place.length === 0) {
@@ -142,13 +160,14 @@ export function parseLocalityCsv(
 
     settled.add(plz);
     places.set(plz, place);
+    if (point) positions.set(plz, point);
   }
 
   if (places.size === 0) {
     errors.push({ line: header.line, message: "Locality CSV has no postal codes" });
   }
   if (errors.length > 0) return { ok: false, errors };
-  return { ok: true, places };
+  return { ok: true, places, atlas: { positions, points } };
 }
 
 export function placeForPlz(places: LocalityMap, plz: string, fallback: string): string {

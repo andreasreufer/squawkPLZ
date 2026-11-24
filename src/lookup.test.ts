@@ -64,6 +64,8 @@ describe("parseLocalityCsv", () => {
     expect(result.ok).toBe(true);
     if (!result.ok) return;
     expect(result.places.get("1000")).toBe("Lausanne 25");
+    expect(result.atlas.positions.get("1000")).toEqual({ e: 2542001, n: 1156759 });
+    expect(result.atlas.points.length).toBeGreaterThan(result.places.size);
     expect(result.places.get("1008")).toBe("Prilly");
     expect(result.places.get("8001")).toBe("Zürich");
     expect(result.places.get("1201")).toBe("Genève");
