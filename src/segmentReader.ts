@@ -94,7 +94,7 @@ const EMPTY_READING: GuideReading = { digits: [null, null, null, null], code: nu
 
 /**
  * Finds the transponder code on a radio page.
- * The squawk is the lower group of exactly four green octal digits. Anything after
+ * The squawk is the lower group of exactly four green octal digits, or grey ones in standby. Anything after
  * that group on the same line is ignored, because the reply annunciator comes and goes.
  */
 export function findSquawk(image: Raster): GuideReading {
@@ -102,19 +102,58 @@ export function findSquawk(image: Raster): GuideReading {
     return EMPTY_READING;
   }
 
-  const green = readGreen(image);
-  // Plain ink is only a fallback for displays without green text; on a radio page it finds labels and frames.
+  const green = readTint(image, GREEN);
+  // Grey is only read on a radio page, whose green frequencies give the text height and mark the rows to skip.
+  const grey = green.lines.length > 0 && green.codes.length === 0 ? readTint(image, GREY, tallestBand(green.bands)) : null;
+  // A standby squawk is grey, but so is a standby frequency, which shares its row with the green active one.
+  const greyCodes = (grey?.codes ?? []).filter(
+    (code) => !green.bands.some((band) => code.top >= band.top - 2 && code.top <= band.bottom),
+  );
+  // Plain ink is only a fallback for displays without colored text; on a radio page it finds labels and frames.
   const chosen =
-    green.lines.length > 0
-      ? lowestCode(green.codes)
-      : lowestCode(codesInMask(inkMask(image), image.width, image.height));
+    green.lines.length === 0
+      ? lowestCode(codesInMask(inkMask(image), image.width, image.height))
+      : (lowestCode(green.codes) ?? lowestCode(greyCodes));
   if (!chosen) return EMPTY_READING;
   return { digits: chosen.digits, code: chosen.digits.join("") };
 }
 
 export function explainSquawk(image: Raster): string[] {
-  return readGreen(image).lines;
+  const green = readTint(image, GREEN);
+  if (green.codes.length > 0 || green.lines.length === 0) return green.lines;
+  return [...green.lines, ...readTint(image, GREY, tallestBand(green.bands)).lines.map((line) => `grey ${line}`)];
 }
+
+function tallestBand(bands: { top: number; bottom: number }[]): number {
+  return Math.max(0, ...bands.map((band) => band.bottom - band.top + 1));
+}
+
+/** How one text color is told apart from the background. */
+type Tint = {
+  /** Loose test that finds the rows of text. */
+  loose: (red: number, green: number, blue: number) => boolean;
+  /** Stroke brightness, or 0 when the pixel is not this color. */
+  strength: (red: number, green: number, blue: number) => number;
+  /** Share of a row's width that must match for the row to hold text. */
+  rowShare: number;
+  /** Share of the brightest stroke that a pixel needs to count as ink. */
+  coreShare: number;
+};
+
+const GREEN: Tint = {
+  loose: (red, green, blue) => green >= 60 && green > red + 25 && green > blue + 10 && green > red * 1.35,
+  strength: (red, green, blue) => (green > red + 18 && green > blue + 10 ? green : 0),
+  rowShare: 0.006,
+  coreShare: 0.45,
+};
+
+const GREY: Tint = {
+  loose: (red, green, blue) => Math.min(red, green, blue) >= 110 && Math.max(red, green, blue) - Math.min(red, green, blue) <= 40,
+  strength: (red, green, blue) => (Math.max(red, green, blue) - Math.min(red, green, blue) <= 45 ? Math.min(red, green, blue) : 0),
+  // The page frame is grey too, and its side lines touch every row.
+  rowShare: 0.03,
+  coreShare: 0.65,
+};
 
 function sampleCell(
   on: Uint8Array,
@@ -204,21 +243,30 @@ function lowestCode(codes: FoundCode[]): FoundCode | null {
   return best;
 }
 
-function readGreen(image: Raster): { codes: FoundCode[]; lines: string[] } {
+function readTint(
+  image: Raster,
+  tint: Tint,
+  textHeight = 0,
+): { codes: FoundCode[]; lines: string[]; bands: { top: number; bottom: number }[] } {
   const codes: FoundCode[] = [];
   const lines: string[] = [];
-  for (const band of greenBands(image)) {
-    const mask = strictBandMask(image, band.top, band.bottom);
+  const bands = tintBands(image, tint, textHeight);
+  for (const band of bands) {
+    const mask = strictBandMask(image, tint, band.top, band.bottom);
     const read = codesInBand(mask, image.width, band.top, band.bottom);
     lines.push(`${band.top}: ${read.text}`);
     codes.push(...read.codes);
   }
-  return { codes, lines };
+  return { codes, lines, bands };
 }
 
-/** Rows of green text that are tall enough to hold the squawk. */
-function greenBands(image: Raster): { top: number; bottom: number }[] {
-  const bands = bandSpans(greenMask(image), image.width, image.height);
+/** Rows of text in one color that are tall enough to hold the squawk. */
+function tintBands(image: Raster, tint: Tint, textHeight = 0): { top: number; bottom: number }[] {
+  const bands = bandSpans(tintMask(image, tint), image.width, image.height, tint.rowShare);
+  // Grey also covers glare and the bezel, so grey rows are sized against the green text when there is some.
+  if (textHeight > 0) {
+    return bands.filter((band) => band.bottom - band.top + 1 >= textHeight * 0.72 && band.bottom - band.top + 1 <= textHeight * 1.6);
+  }
   let tallest = 0;
   for (const band of bands) tallest = Math.max(tallest, band.bottom - band.top + 1);
   return bands.filter((band) => band.bottom - band.top + 1 >= tallest * 0.72);
@@ -226,13 +274,13 @@ function greenBands(image: Raster): { top: number; bottom: number }[] {
 
 /** The glyph boxes of every green text line, for training and diagnostics. */
 export function greenLines(image: Raster): GlyphLine[] {
-  return greenBands(image).map((band) =>
-    lineBoxes(strictBandMask(image, band.top, band.bottom), image.width, band.top, band.bottom),
+  return tintBands(image, GREEN).map((band) =>
+    lineBoxes(strictBandMask(image, GREEN, band.top, band.bottom), image.width, band.top, band.bottom),
   );
 }
 
-function bandSpans(mask: Uint8Array, width: number, height: number): { top: number; bottom: number }[] {
-  const rowThreshold = Math.max(4, Math.floor(width * 0.006));
+function bandSpans(mask: Uint8Array, width: number, height: number, rowShare = 0.006): { top: number; bottom: number }[] {
+  const rowThreshold = Math.max(4, Math.floor(width * rowShare));
   const bands: { top: number; bottom: number }[] = [];
   let bandTop = -1;
   for (let y = 0; y <= height; y += 1) {
@@ -255,7 +303,7 @@ function bandSpans(mask: Uint8Array, width: number, height: number): { top: numb
  * Keeps the bright core of each stroke so camera bloom does not fuse neighboring digits.
  * The band is softened first, because a photo of an LCD shows its pixel grid as gaps through every stroke.
  */
-function strictBandMask(image: Raster, top: number, bottom: number): Uint8Array {
+function strictBandMask(image: Raster, tint: Tint, top: number, bottom: number): Uint8Array {
   const { width, height } = image;
   const radius = Math.max(1, Math.round((bottom - top + 1) / 30));
   const data = blurRows(image, top, bottom, radius);
@@ -263,23 +311,35 @@ function strictBandMask(image: Raster, top: number, bottom: number): Uint8Array 
   for (let y = top; y <= bottom; y += 1) {
     for (let x = 0; x < width; x += 1) {
       const index = (y * width + x) * 4;
-      const red = data[index] ?? 0;
-      const green = data[index + 1] ?? 0;
-      const blue = data[index + 2] ?? 0;
-      if (green >= 45 && green > red + 15 && green > blue + 8 && green > peak) peak = green;
+      peak = Math.max(peak, tint.strength(data[index] ?? 0, data[index + 1] ?? 0, data[index + 2] ?? 0));
     }
   }
-  const cut = Math.max(50, peak * 0.45);
+  const cut = Math.max(50, peak * tint.coreShare);
   const mask = new Uint8Array(width * height);
   for (let y = top; y <= bottom; y += 1) {
     const row = y * width;
     for (let x = 0; x < width; x += 1) {
       const index = (y * width + x) * 4;
-      const red = data[index] ?? 0;
-      const green = data[index + 1] ?? 0;
-      const blue = data[index + 2] ?? 0;
-      if (green >= cut && green > red + 18 && green > blue + 10) mask[row + x] = 1;
+      if (tint.strength(data[index] ?? 0, data[index + 1] ?? 0, data[index + 2] ?? 0) >= cut) mask[row + x] = 1;
     }
+  }
+  // A frame line runs on above and below the text, and would otherwise read as a 1 beside the squawk.
+  const reach = Math.max(2, Math.round((bottom - top + 1) / 3));
+  const above = top - reach;
+  const below = bottom + reach;
+  if (above < 0 || below >= height) return mask;
+  // The line leans a little in a photo, so it is looked for a few columns to either side.
+  const lean = Math.max(1, Math.round(reach / 3));
+  const inked = (x: number, y: number) => {
+    for (let sx = Math.max(0, x - lean); sx <= Math.min(width - 1, x + lean); sx += 1) {
+      const index = (y * width + sx) * 4;
+      if (tint.loose(image.data[index] ?? 0, image.data[index + 1] ?? 0, image.data[index + 2] ?? 0)) return true;
+    }
+    return false;
+  };
+  for (let x = 0; x < width; x += 1) {
+    if (!inked(x, above) || !inked(x, below)) continue;
+    for (let y = top; y <= bottom; y += 1) mask[y * width + x] = 0;
   }
   return mask;
 }
@@ -334,14 +394,11 @@ function blurRows(image: Raster, top: number, bottom: number, radius: number): U
   return blurred;
 }
 
-function greenMask(image: Raster): Uint8Array {
+function tintMask(image: Raster, tint: Tint): Uint8Array {
   const mask = new Uint8Array(image.width * image.height);
   const { data } = image;
   for (let pixel = 0, index = 0; pixel < mask.length; pixel += 1, index += 4) {
-    const red = data[index] ?? 0;
-    const green = data[index + 1] ?? 0;
-    const blue = data[index + 2] ?? 0;
-    if (green >= 60 && green > red + 25 && green > blue + 10 && green > red * 1.35) mask[pixel] = 1;
+    if (tint.loose(data[index] ?? 0, data[index + 1] ?? 0, data[index + 2] ?? 0)) mask[pixel] = 1;
   }
   return mask;
 }

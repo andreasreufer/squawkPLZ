@@ -78,6 +78,11 @@ describe("findSquawk", () => {
     const photo = decodePng(readFileSync(new URL(`./fixtures/${fixture}`, import.meta.url)));
     expect(findSquawk(photo).code).toBe(code);
   });
+
+  it("reads a grey standby squawk beside its white frame", () => {
+    const photo = decodePng(readFileSync(new URL("./fixtures/xpdr-0123-grey.png", import.meta.url)));
+    expect(findSquawk(photo).code).toBe("0123");
+  });
 });
 
 function renderDigits(digits: number[], invert: boolean): Raster {

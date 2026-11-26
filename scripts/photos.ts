@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import jpeg from "jpeg-js";
-import type { Raster } from "../src/segmentReader";
+import { greenLines, type Raster } from "../src/segmentReader";
 import { decodePng } from "./png";
 
 export const TRAINING_DIR = new URL("../training_data/", import.meta.url).pathname;
@@ -22,6 +22,22 @@ export function loadPhoto(name: string, edge: number): Raster {
         return { width: decoded.width, height: decoded.height, data: new Uint8ClampedArray(decoded.data) };
       })();
   return shrink(image, edge);
+}
+
+/** Turns the green squawk grey, like a standby squawk, so grey reading can be checked on every photo. */
+export function greyed(image: Raster): Raster {
+  // The squawk is the one green line of exactly four digits and no dot.
+  const line = greenLines(image).find((candidate) => candidate.boxes.filter((box) => !box.breaksRun).length === 4);
+  const data = new Uint8ClampedArray(image.data);
+  if (!line) return { ...image, data };
+  const margin = Math.round((line.bottom - line.top) / 2);
+  const from = Math.max(0, line.top - margin) * image.width * 4;
+  const to = Math.min(image.height, line.bottom + margin + 1) * image.width * 4;
+  for (let index = from; index < to; index += 4) {
+    const green = data[index + 1] ?? 0;
+    if (green > (data[index] ?? 0) + 10 && green > (data[index + 2] ?? 0)) data[index] = data[index + 2] = green;
+  }
+  return { ...image, data };
 }
 
 /** Box-filter downscale, close to what a canvas does when it draws a video frame smaller. */
