@@ -79,6 +79,11 @@ describe("findSquawk", () => {
     expect(findSquawk(photo).code).toBe(code);
   });
 
+  it("reads a grey squawk filling the guide beside the screen frame", () => {
+    const photo = decodePng(readFileSync(new URL("./fixtures/guide-4567-grey.png", import.meta.url)));
+    expect(findSquawk(photo).code).toBe("4567");
+  });
+
   it("reads a grey standby squawk beside its white frame", () => {
     const photo = decodePng(readFileSync(new URL("./fixtures/xpdr-0123-grey.png", import.meta.url)));
     expect(findSquawk(photo).code).toBe("0123");

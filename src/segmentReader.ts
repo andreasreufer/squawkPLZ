@@ -103,28 +103,66 @@ export function findSquawk(image: Raster): GuideReading {
   }
 
   const green = readTint(image, GREEN);
-  // Grey is only read on a radio page, whose green frequencies give the text height and mark the rows to skip.
-  const grey = green.lines.length > 0 && green.codes.length === 0 ? readTint(image, GREY, tallestBand(green.bands)) : null;
-  // A standby squawk is grey, but so is a standby frequency, which shares its row with the green active one.
-  const greyCodes = (grey?.codes ?? []).filter(
-    (code) => !green.bands.some((band) => code.top >= band.top - 2 && code.top <= band.bottom),
+  // Plain ink reads a guide filled by a grey squawk; on a whole radio page it would find labels and frames.
+  const ink = () => asReading(lowestCode(codesInMask(inkMask(image), image.width, image.height)));
+  // A frequency is how a page is told from a guide whose grey digits have green color fringes.
+  const page = green.lines.some((line) => /\d\.\d/.test(line));
+  if (green.lines.length === 0) return ink();
+  // A standby squawk is grey. The green frequencies give the text height for reading it.
+  const textHeight = tallestBand(green.bands);
+  const grey = readTint(image, GREY, textHeight);
+  // A grey standby frequency shares its row with the green active one, off to its side.
+  // Green in the same columns is only the color fringe of grey digits.
+  const greyCodes = grey.codes.filter(
+    (code) => !greenBeside(green.mask, image.width, code),
   );
-  // Plain ink is only a fallback for displays without colored text; on a radio page it finds labels and frames.
-  const chosen =
-    green.lines.length === 0
-      ? lowestCode(codesInMask(inkMask(image), image.width, image.height))
-      : (lowestCode(green.codes) ?? lowestCode(greyCodes));
+  // The squawk lines up with the left edge of the active frequencies; labels are centered and the ADF frequency is right-aligned.
+  const left = inkLeft(green.mask, image.width, green.bands);
+  const codes = [...green.codes, ...greyCodes].filter((code) => code.left <= left + textHeight * 1.5);
+  if (codes.length > 0) return asReading(lowestCode(codes));
+  return page ? EMPTY_READING : ink();
+}
+
+/** Whether green ink shares the rows of a code but lies clear of its columns. */
+function greenBeside(mask: Uint8Array, width: number, code: FoundCode): boolean {
+  const gap = Math.round((code.bottom - code.top + 1) * 0.5);
+  let ink = 0;
+  for (let y = code.top; y <= code.bottom; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      if (x >= code.left - gap && x <= code.right + gap) continue;
+      ink += mask[y * width + x] ?? 0;
+    }
+  }
+  return ink > code.bottom - code.top + 1;
+}
+
+function asReading(chosen: FoundCode | null): GuideReading {
   if (!chosen) return EMPTY_READING;
   return { digits: chosen.digits, code: chosen.digits.join("") };
 }
 
 export function explainSquawk(image: Raster): string[] {
   const green = readTint(image, GREEN);
-  if (green.codes.length > 0 || green.lines.length === 0) return green.lines;
+  if (green.lines.length === 0) return green.lines;
   return [...green.lines, ...readTint(image, GREY, tallestBand(green.bands)).lines.map((line) => `grey ${line}`)];
 }
 
-function tallestBand(bands: { top: number; bottom: number }[]): number {
+type Band = { top: number; bottom: number };
+
+/** The leftmost inked column in some rows. */
+function inkLeft(mask: Uint8Array, width: number, bands: Band[]): number {
+  let left = width;
+  for (const band of bands) {
+    for (let y = band.top; y <= band.bottom; y += 1) {
+      for (let x = 0; x < left; x += 1) {
+        if (mask[y * width + x]) left = x;
+      }
+    }
+  }
+  return left;
+}
+
+function tallestBand(bands: Band[]): number {
   return Math.max(0, ...bands.map((band) => band.bottom - band.top + 1));
 }
 
@@ -134,8 +172,6 @@ type Tint = {
   loose: (red: number, green: number, blue: number) => boolean;
   /** Stroke brightness, or 0 when the pixel is not this color. */
   strength: (red: number, green: number, blue: number) => number;
-  /** Share of a row's width that must match for the row to hold text. */
-  rowShare: number;
   /** Share of the brightest stroke that a pixel needs to count as ink. */
   coreShare: number;
 };
@@ -143,15 +179,12 @@ type Tint = {
 const GREEN: Tint = {
   loose: (red, green, blue) => green >= 60 && green > red + 25 && green > blue + 10 && green > red * 1.35,
   strength: (red, green, blue) => (green > red + 18 && green > blue + 10 ? green : 0),
-  rowShare: 0.006,
   coreShare: 0.45,
 };
 
 const GREY: Tint = {
   loose: (red, green, blue) => Math.min(red, green, blue) >= 110 && Math.max(red, green, blue) - Math.min(red, green, blue) <= 40,
   strength: (red, green, blue) => (Math.max(red, green, blue) - Math.min(red, green, blue) <= 45 ? Math.min(red, green, blue) : 0),
-  // The page frame is grey too, and its side lines touch every row.
-  rowShare: 0.03,
   coreShare: 0.65,
 };
 
@@ -233,7 +266,7 @@ function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
 }
 
-type FoundCode = { digits: number[]; top: number };
+type FoundCode = { digits: number[]; top: number; bottom: number; left: number; right: number };
 
 function lowestCode(codes: FoundCode[]): FoundCode | null {
   let best: FoundCode | null = null;
@@ -247,40 +280,47 @@ function readTint(
   image: Raster,
   tint: Tint,
   textHeight = 0,
-): { codes: FoundCode[]; lines: string[]; bands: { top: number; bottom: number }[] } {
+): { codes: FoundCode[]; lines: string[]; bands: Band[]; spans: Band[]; mask: Uint8Array } {
   const codes: FoundCode[] = [];
   const lines: string[] = [];
-  const bands = tintBands(image, tint, textHeight);
+  const { bands, spans, mask: colored } = tintBands(image, tint, textHeight);
   for (const band of bands) {
     const mask = strictBandMask(image, tint, band.top, band.bottom);
     const read = codesInBand(mask, image.width, band.top, band.bottom);
     lines.push(`${band.top}: ${read.text}`);
     codes.push(...read.codes);
   }
-  return { codes, lines, bands };
+  return { codes, lines, bands, spans, mask: colored };
 }
 
 /** Rows of text in one color that are tall enough to hold the squawk. */
-function tintBands(image: Raster, tint: Tint, textHeight = 0): { top: number; bottom: number }[] {
-  const bands = bandSpans(tintMask(image, tint), image.width, image.height, tint.rowShare);
+/** Rows of text in one color: `bands` can hold the squawk, `spans` are all text of any size. */
+function tintBands(image: Raster, tint: Tint, textHeight = 0): { bands: Band[]; spans: Band[]; mask: Uint8Array } {
+  // The page frame is grey too; its side lines touch every row, so lines taller than the text are dropped.
+  const mask = tintMask(image, tint, Math.round(textHeight * 0.7));
+  const all = bandSpans(mask, image.width, image.height);
+  const height = (band: Band) => band.bottom - band.top + 1;
   // Grey also covers glare and the bezel, so grey rows are sized against the green text when there is some.
   if (textHeight > 0) {
-    return bands.filter((band) => band.bottom - band.top + 1 >= textHeight * 0.72 && band.bottom - band.top + 1 <= textHeight * 1.6);
+    return {
+      bands: all.filter((band) => height(band) >= textHeight * 0.72 && height(band) <= textHeight * 1.6),
+      spans: all.filter((band) => height(band) >= textHeight * 0.4 && height(band) <= textHeight * 1.6),
+      mask,
+    };
   }
-  let tallest = 0;
-  for (const band of bands) tallest = Math.max(tallest, band.bottom - band.top + 1);
-  return bands.filter((band) => band.bottom - band.top + 1 >= tallest * 0.72);
+  const tallest = tallestBand(all);
+  return { bands: all.filter((band) => height(band) >= tallest * 0.72), spans: all, mask };
 }
 
 /** The glyph boxes of every green text line, for training and diagnostics. */
 export function greenLines(image: Raster): GlyphLine[] {
-  return tintBands(image, GREEN).map((band) =>
+  return tintBands(image, GREEN).bands.map((band) =>
     lineBoxes(strictBandMask(image, GREEN, band.top, band.bottom), image.width, band.top, band.bottom),
   );
 }
 
-function bandSpans(mask: Uint8Array, width: number, height: number, rowShare = 0.006): { top: number; bottom: number }[] {
-  const rowThreshold = Math.max(4, Math.floor(width * rowShare));
+function bandSpans(mask: Uint8Array, width: number, height: number): Band[] {
+  const rowThreshold = Math.max(4, Math.floor(width * 0.006));
   const bands: { top: number; bottom: number }[] = [];
   let bandTop = -1;
   for (let y = 0; y <= height; y += 1) {
@@ -394,13 +434,23 @@ function blurRows(image: Raster, top: number, bottom: number, radius: number): U
   return blurred;
 }
 
-function tintMask(image: Raster, tint: Tint): Uint8Array {
-  const mask = new Uint8Array(image.width * image.height);
-  const { data } = image;
+/** Pixels of one color; with a reach, pixels on a line running that far above and below are left out. */
+function tintMask(image: Raster, tint: Tint, reach = 0): Uint8Array {
+  const { width, height, data } = image;
+  const mask = new Uint8Array(width * height);
   for (let pixel = 0, index = 0; pixel < mask.length; pixel += 1, index += 4) {
     if (tint.loose(data[index] ?? 0, data[index + 1] ?? 0, data[index + 2] ?? 0)) mask[pixel] = 1;
   }
-  return mask;
+  if (reach <= 0) return mask;
+  const near = (x: number, y: number) =>
+    y >= 0 && y < height && ((mask[y * width + x] ?? 0) | (mask[y * width + x - 1] ?? 0) | (mask[y * width + x + 1] ?? 0)) === 1;
+  const kept = new Uint8Array(mask);
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 1; x < width - 1; x += 1) {
+      if (mask[y * width + x] && near(x, y - reach) && near(x, y + reach)) kept[y * width + x] = 0;
+    }
+  }
+  return kept;
 }
 
 function inkMask(image: Raster): Uint8Array {
@@ -416,7 +466,32 @@ function inkMask(image: Raster): Uint8Array {
     const value = gray[i] ?? 0;
     mask[i] = (litIsBright ? value > threshold : value <= threshold) ? 1 : 0;
   }
+  dropFullHeightLines(mask, image.width, image.height);
   return mask;
+}
+
+/**
+ * Clears lines that run from the top edge to the bottom edge, such as the screen frame at the side of the guide.
+ * Digits leave a margin, and a line may lean by a column per row.
+ */
+function dropFullHeightLines(mask: Uint8Array, width: number, height: number): void {
+  for (let start = 0; start < width; start += 1) {
+    if (!mask[start]) continue;
+    const path = [start];
+    for (let y = 1; y < height; y += 1) {
+      const x = path[y - 1] ?? 0;
+      const next = [x, x - 1, x + 1].find((candidate) => candidate >= 0 && candidate < width && mask[y * width + candidate]);
+      if (next === undefined) break;
+      path.push(next);
+    }
+    if (path.length < height) continue;
+    path.forEach((x, y) => {
+      for (let dx = -2; dx <= 2; dx += 1) {
+        // Only the line's own run of ink is cleared, not a digit it touches.
+        if (x + dx >= 0 && x + dx < width) mask[y * width + x + dx] = 0;
+      }
+    });
+  }
 }
 
 function codesInMask(mask: Uint8Array, width: number, height: number): FoundCode[] {
@@ -550,7 +625,7 @@ function codesInBand(
 
   let runBoxes: GlyphBox[] = [];
   const flush = () => {
-    if (!poisoned && run.length === 4 && evenlySpaced(runBoxes, run, glyphHeight)) found.push({ digits: run.slice(), top });
+    if (!poisoned && run.length === 4 && evenlySpaced(runBoxes, run, glyphHeight)) found.push({ digits: run.slice(), top, bottom, left: runBoxes[0]?.left ?? 0, right: runBoxes.at(-1)?.right ?? 0 });
     run = [];
     runBoxes = [];
     poisoned = false;
